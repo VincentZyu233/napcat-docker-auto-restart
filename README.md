@@ -19,6 +19,11 @@
   - **心跳错位**：支持设置多个容器间的检测错开时间，避免瞬间打满宿主机资源。
 - **跨平台运行**：支持安装了 Python 3.8+ 的 Windows、Linux 和 macOS。
 - **自动恢复**：通过 WebSocket 实时获取 Bot 运行状态，非在线即触发 SSH 执行 `docker restart`。
+- **防重启风暴**：
+  - **启动宽限期**：容器刚启动后的指定秒数内只观察不重启，给 NapCat 充足的登录与端口监听时间。
+  - **重启冷却**：两次自动重启之间强制间隔，避免瞬时连续重启。
+  - **连续熔断**：达到最大连续重启次数后自动暂停重启并告警，防止死循环。
+  - **精准响应匹配**：按 `echo` 标识匹配 OneBot API 响应，忽略推送的心跳/事件，彻底避免误判。
 
 ---
 
@@ -101,7 +106,7 @@ ssh root@<YOUR_SERVER> "echo '✅ SSH 免密登录配置成功！'"
 配置文件使用 YAML 格式，可以参考 `py/config.example.yaml`。
 
 ```yaml
-check_interval_ms: 10000     # 总检测频率
+check_interval_ms: 10000      # 总检测频率
 stagger_interval_ms: 500      # 容器间错开时间
 
 containers:
@@ -113,10 +118,15 @@ containers:
     token: your_token         # Access Token
     auto_restart: true        # 离线是否自动重启
     use_sudo: false           # 是否使用 sudo
+    startup_grace_s: 120      # 容器启动后的宽限期（秒），期间只观察不重启
+    restart_cooldown_s: 300   # 两次自动重启之间的最小间隔（秒）
+    max_restart_attempts: 3   # 连续自动重启次数上限，超过后只告警
 ```
 
 **配置说明**：
 - `use_sudo`: 如果 SSH 用户不在 docker 组，需设为 `true` 并配置 sudo 免密（见下方）
+- `startup_grace_s` / `restart_cooldown_s` / `max_restart_attempts`: 防「重启风暴」的三道保险，都可省略，省略时使用默认值（`120` / `300` / `3`），详见下面「防重启风暴」一节
+
 
 #### 配置 sudo 免密（可选）
 
@@ -146,21 +156,30 @@ python src/main.py
 
 ## 🛠️ 进阶技巧：配合 NapCat 自动登录
 
-为了保证重启后能自动登录，**强烈建议**在 Docker 容器中配置 `ACCOUNT` 环境变量。
+为了保证重启后能自动登录，**强烈建议**在 Docker 容器中同时配置 `ACCOUNT` 和密码回退环境变量 `NAPCAT_QUICK_PASSWORD`（或 `NAPCAT_QUICK_PASSWORD_MD5`）。
+
+> **说明**：NapCat 官方在新版本中对自动登录进行了两级保护：
+> 1. 首先尝试使用本地凭证快速登录；
+> 2. 若凭证失效，则自动回退到 `NAPCAT_QUICK_PASSWORD` 环境变量配置的密码进行登录；
+> 3. 若未配置密码，才会退化为需要扫码的二维码登录模式。
 
 **方法一：命令行重启容器**
 ```bash
 docker run -d \
   -e ACCOUNT=你的QQ号 \
+  -e NAPCAT_QUICK_PASSWORD=你的QQ密码 \
   -p 3000:3000 \
   -v napcat-config:/app/napcat/config \
+  -v napcat-qq:/app/.config/QQ \
   --name napcat-dev \
   mlikiowa/napcat-docker:latest
 ```
 
 **方法二：1Panel 面板**
 1. 进入容器详情 -> 编辑。
-2. 在环境变量中添加 `ACCOUNT=你的QQ号`。
+2. 在环境变量中添加：
+   - `ACCOUNT=你的QQ号`
+   - `NAPCAT_QUICK_PASSWORD=你的QQ密码`（可选 MD5：`NAPCAT_QUICK_PASSWORD_MD5=32位大写或小写MD5`）
 3. 保存并由面板自动重建容器。
 
 ---

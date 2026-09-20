@@ -17,7 +17,10 @@ class ContainerConfig:
     token: str
     enabled: bool = True
     auto_restart: bool = True
-    use_sudo: bool = False      # 是否使用 sudo（如果用户在 docker 组则设为 False）
+    use_sudo: bool = False          # 是否使用 sudo（如果用户在 docker 组则设为 False）
+    startup_grace_s: int = 120      # 容器刚启动后的宽限期（秒），期间只观察不重启
+    restart_cooldown_s: int = 300   # 两次自动重启之间的最小间隔（秒）
+    max_restart_attempts: int = 3   # 连续自动重启次数上限，超过后只告警不再重启
 
 @dataclass
 class AppConfig:
@@ -68,7 +71,10 @@ def load_config(config_path: str = None) -> AppConfig:
             token=c["token"],
             enabled=c.get("enabled", True),
             auto_restart=c.get("auto_restart", True),
-            use_sudo=c.get("use_sudo", False)
+            use_sudo=c.get("use_sudo", False),
+            startup_grace_s=c.get("startup_grace_s", 120),
+            restart_cooldown_s=c.get("restart_cooldown_s", 300),
+            max_restart_attempts=c.get("max_restart_attempts", 3)
         ))
     
     return AppConfig(
