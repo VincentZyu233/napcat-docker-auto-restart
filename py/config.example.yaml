@@ -33,7 +33,7 @@ containers:
     startup_grace_s: 120       # 容器启动后的宽限期（秒）：期间只观察、不重启
     restart_cooldown_s: 300    # 两次自动重启之间的最小间隔（秒）：冷却期内只告警不重启
     max_restart_attempts: 3    # 连续自动重启次数上限：超过后只告警，等人工介入（恢复在线后清零）
-    deep_probe: true           # 深度探测：调用需要服务端往返的接口识别「假在线」（老版本不支持会自动跳过）
+    deep_probe: true           # 深度探测（仅诊断告警、不会触发重启；老版本 NapCat 不支持会自动跳过）
 
 # You can add more containers
 # - enabled: true

@@ -58,11 +58,17 @@ class RestartState:
     deep_fail_count: int = 0                 # 深度探测连续失败次数
 
     def reset(self):
-        """恢复在线后清零"""
+        """恢复在线后清零（含深度探测计数）"""
         self.attempts = 0
         self.last_restart_at = None
         self.needs_human = False
         self.deep_fail_count = 0
+
+    def reset_restart_state(self):
+        """只清「重启相关」状态，保留深度探测计数（它由探测结果单独维护）"""
+        self.attempts = 0
+        self.last_restart_at = None
+        self.needs_human = False
 
 
 def parse_docker_time(value: str) -> Optional[datetime]:
@@ -244,9 +250,10 @@ async def deep_probe_session(container: ContainerConfig, timeout: float = 12.0,
 
 def escalate_deep_failure(state: RestartState, threshold: int = DEEP_FAIL_THRESHOLD) -> bool:
     """
-    纯逻辑：累计深度探测失败次数，达到阈值才升级为「离线」判定
+    纯逻辑：累计深度探测失败次数，达到阈值时返回 True（用于「告警」）
 
-    目的：单次深度探测失败可能只是冷启动/网络抖动，避免误判导致的误重启。
+    注意：深度探测仅用于诊断/告警，**不会**触发自动重启
+    （实测 get_cookies 有冷缓存、偶发长时间无响应，据此重启会误杀健康容器）。
     """
     state.deep_fail_count += 1
     return state.deep_fail_count >= threshold

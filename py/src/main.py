@@ -45,12 +45,21 @@ async def monitor_container(container: ContainerConfig, state: RestartState, con
             if deep.reason == "unsupported":
                 log(f"[{container.name}] 深度探测接口不被当前 NapCat 版本支持，跳过该判据", "INFO")
         else:
-            # 单次失败不判死（可能是冷启动/瞬时抖动），连续失败才升级为离线
+            # 深度探测只做「诊断」：失败只告警、绝不触发自动重启
+            # （实测 get_cookies 存在冷缓存/偶发长时间无响应，若据此重启会误杀健康容器）
             escalated = escalate_deep_failure(state)
             log(f"[{container.name}] 深度探测失败({state.deep_fail_count}/{DEEP_FAIL_THRESHOLD} 次): {deep.message}", "WARN")
             if escalated:
-                log(f"[{container.name}] 深度探测连续失败 {DEEP_FAIL_THRESHOLD} 次，判定为「假在线」", "ERROR")
-                result = deep
+                log(
+                    f"[{container.name}] 深度探测连续失败 {DEEP_FAIL_THRESHOLD} 次，会话可能异常"
+                    "（仅告警，不自动重启；如频繁出现可把该容器的 deep_probe 设为 false）",
+                    "ERROR",
+                )
+                notify_container_event(
+                    config, state, container, "deep_probe", "会话疑似异常（仅告警）",
+                    f"{deep.message}\nget_status 仍显示在线，本项不会触发重启。\n"
+                    "若频繁出现：可用 WebUI 检查登录状态，或把该容器的 deep_probe 设为 false"
+                )
 
     if result.online:
         if state.attempts > 0 or state.needs_human:
@@ -59,7 +68,8 @@ async def monitor_container(container: ContainerConfig, state: RestartState, con
                                    "Bot 已恢复正常在线状态")
         else:
             log(f"[{container.name}] 在线 ✓", "SUCCESS")
-        state.reset()
+        # 只清重启相关状态，保留深度探测计数（该计数由深度探测结果单独维护）
+        state.reset_restart_state()
         return
 
     log(f"[{container.name}] 离线! 原因: {result.message}", "ERROR")
