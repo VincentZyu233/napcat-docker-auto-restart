@@ -24,6 +24,10 @@
   - **重启冷却**：两次自动重启之间强制间隔，避免瞬时连续重启。
   - **连续熔断**：达到最大连续重启次数后自动暂停重启并告警，防止死循环。
   - **精准响应匹配**：按 `echo` 标识匹配 OneBot API 响应，忽略推送的心跳/事件，彻底避免误判。
+  - **离线复检防抖**：首次探测失败后自动复检一次，过滤瞬时抖动，避免误重启。
+  - **假在线深度探测**：调用需要服务端真实往返的只读接口（`get_cookies`）识别「连接还在但服务端已不响应」，连续失败 3 次才判死。
+  - **人工介入识别**：识别「被顶下线 / 登录态失效 / 需要扫码 / 需要验证码」等**重启无法解决**的故障，直接跳过重启并告警（避免反复触发风控）。
+  - **可选通知**：支持 webhook / Telegram 推送（掉线、需要人工介入、触发熔断、恢复在线）。
 
 ---
 
@@ -108,6 +112,12 @@ ssh root@<YOUR_SERVER> "echo '✅ SSH 免密登录配置成功！'"
 ```yaml
 check_interval_ms: 10000      # 总检测频率
 stagger_interval_ms: 500      # 容器间错开时间
+confirm_delay_ms: 3000        # 首次探测失败后的复检等待（毫秒）
+offline_log_window_s: 600     # 判定「需要人工介入」时回溯容器日志的时间窗（秒）
+notify_webhook: ""            # 通知 webhook（POST JSON），留空不通知
+notify_telegram_bot_token: "" # Telegram Bot Token（可选）
+notify_telegram_chat_id: ""   # Telegram Chat ID（可选）
+notify_min_interval_s: 1800   # 同类通知最小间隔（秒）
 
 containers:
   - enabled: true             # 是否启用
@@ -121,6 +131,7 @@ containers:
     startup_grace_s: 120      # 容器启动后的宽限期（秒），期间只观察不重启
     restart_cooldown_s: 300   # 两次自动重启之间的最小间隔（秒）
     max_restart_attempts: 3   # 连续自动重启次数上限，超过后只告警
+    deep_probe: true          # 深度探测（识别假在线），老版本 NapCat 不支持会自动跳过
 ```
 
 **配置说明**：

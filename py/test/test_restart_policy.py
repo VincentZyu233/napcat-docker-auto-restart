@@ -18,8 +18,12 @@ from monitor import (  # noqa: E402
     ContainerInfo,
     RestartState,
     _recv_action_response,
+    classify_deep_probe,
+    escalate_deep_failure,
     evaluate_restart,
+    match_login_fail_signals,
     parse_docker_time,
+    should_notify,
 )
 
 PASSED = 0
@@ -111,6 +115,47 @@ def test_evaluate_restart():
     check("容器不存在时允许重启", should is True, f"实际: {should} / {why}")
 
 
+def test_deep_probe_and_signals():
+    print("classify_deep_probe / match_login_fail_signals / should_notify")
+    # 深度探测：正常返回 → 在线
+    r = classify_deep_probe({"status": "ok", "data": {}})
+    check("深度探测正常→在线", r.online and r.reason == "online", f"实际: {r}")
+
+    # 老版本 NapCat 不认识该接口 → 忽略该判据（不应误判为掉线）
+    r = classify_deep_probe({"status": "failed", "message": "不支持的 API"})
+    check("接口不支持→忽略（视为在线）", r.online and r.reason == "unsupported", f"实际: {r}")
+    r = classify_deep_probe({"status": "failed", "message": "unknown action: get_cookies"})
+    check("unknown action→忽略", r.online and r.reason == "unsupported", f"实际: {r}")
+
+    # 其它错误 → 判定为「假在线」
+    r = classify_deep_probe({"status": "failed", "message": "请求超时"})
+    check("其它错误→判定会话卡死", (not r.online) and r.reason == "session_stuck", f"实际: {r}")
+
+    # 容器日志信号匹配
+    kk = "[KickedOffLine] [下线通知] 你的账号当前登录已失效，请重新登录。"
+    qr = "请扫描下面的二维码，然后在手Q上授权登录："
+    hits = match_login_fail_signals(kk + "\n" + qr)
+    check("能识别『被顶下线』", any("顶下线" in h for h in hits), f"实际: {hits}")
+    check("能识别『需要扫码』", any("扫码" in h for h in hits), f"实际: {hits}")
+    check("正常日志不误报", match_login_fail_signals("15:00 [info] 接收 <- 群聊 [测试群]") == [])
+
+    # 通知限流
+    st = RestartState()
+    check("首次可通知", should_notify(st, "needs_human", 1800, now_monotonic=100.0) is True)
+    st.last_notify_kind = "needs_human"
+    st.last_notify_at = 100.0
+    check("同类未到间隔→不通知", should_notify(st, "needs_human", 1800, now_monotonic=200.0) is False)
+    check("同类超过间隔→通知", should_notify(st, "needs_human", 1800, now_monotonic=2000.0) is True)
+    check("不同类型→立即通知", should_notify(st, "breaker", 1800, now_monotonic=101.0) is True)
+
+    # 深度探测失败升级：连续 2 次才判死（避免冷启动/抖动误判）
+    st = RestartState()
+    check("第 1 次深度探测失败→不判死", escalate_deep_failure(st, 2) is False)
+    check("第 2 次深度探测失败→判死", escalate_deep_failure(st, 2) is True)
+    st.reset()
+    check("reset 后深度失败计数清零", st.deep_fail_count == 0)
+
+
 class FakeWebSocket:
     """按顺序吐出预设帧的假 WebSocket，用于测试响应匹配逻辑"""
 
@@ -185,6 +230,10 @@ containers:
             "原有字段保持兼容",
             config.check_interval_ms == 10000 and c1.token == "t" and c1.auto_restart is True and c1.use_sudo is False,
         )
+        check("默认 deep_probe=True", c1.deep_probe is True, f"实际: {c1.deep_probe}")
+        check("默认 confirm_delay_ms=3000", config.confirm_delay_ms == 3000, f"实际: {config.confirm_delay_ms}")
+        check("默认 offline_log_window_s=600", config.offline_log_window_s == 600)
+        check("默认未配置通知渠道", config.notify_webhook == "" and config.notify_telegram_bot_token == "")
     finally:
         os.remove(path)
 
@@ -195,6 +244,7 @@ if __name__ == "__main__":
     print("=" * 50)
     test_parse_docker_time()
     test_evaluate_restart()
+    test_deep_probe_and_signals()
     test_recv_action_response()
     test_config_defaults()
     print("-" * 50)

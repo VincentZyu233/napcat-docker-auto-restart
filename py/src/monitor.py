@@ -15,13 +15,18 @@ import json
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
 import websockets
 
-from config import ContainerConfig
+from config import AppConfig, ContainerConfig
+
+# 深度探测（假在线）判定：连续失败达到该次数才升级为「离线」
+DEEP_FAIL_THRESHOLD = 3
 
 
 @dataclass
@@ -47,11 +52,17 @@ class RestartState:
     """单个容器的自动重启节流状态"""
     attempts: int = 0                        # 连续自动重启次数（恢复在线后清零）
     last_restart_at: Optional[float] = None  # 上次自动重启时刻（time.monotonic()）
+    last_notify_at: Optional[float] = None   # 上次通知时刻
+    last_notify_kind: str = ""               # 上次通知的类型（用于限流）
+    needs_human: bool = False                # 是否处于「需要人工介入」状态
+    deep_fail_count: int = 0                 # 深度探测连续失败次数
 
     def reset(self):
         """恢复在线后清零"""
         self.attempts = 0
         self.last_restart_at = None
+        self.needs_human = False
+        self.deep_fail_count = 0
 
 
 def parse_docker_time(value: str) -> Optional[datetime]:
@@ -133,43 +144,54 @@ async def _recv_action_response(websocket, echo: str, max_frames: int = 50) -> d
     raise ValueError(f"连续 {max_frames} 帧都没有收到 echo={echo} 的响应")
 
 
-async def check_container_status(container: ContainerConfig, timeout: float = 5.0) -> StatusResult:
+async def _ws_action_call(
+    container: ContainerConfig, action: str, params: dict, timeout: float
+) -> Tuple[Optional[dict], Optional[StatusResult]]:
     """
-    通过 OneBot11 WebSocket 检查 Bot 是否在线
-
-    Args:
-        container: 容器配置
-        timeout: 超时时间（秒）
+    通过 WebSocket 调用一次 OneBot action（按 echo 精确匹配响应）
 
     Returns:
-        StatusResult
+        (响应JSON, 错误StatusResult) —— 成功时第二个元素为 None
     """
     uri = f"ws://{container.ssh_host}:{container.ws_port}?access_token={container.token}"
-    echo = f"status_{int(time.time() * 1000)}"
+    echo = f"{action}_{int(time.time() * 1000)}"
 
     try:
         async with asyncio.timeout(timeout):
             async with websockets.connect(uri) as websocket:
                 await websocket.send(json.dumps({
-                    "action": "get_status",
-                    "params": {},
+                    "action": action,
+                    "params": params,
                     "echo": echo,
                 }))
-                result = await _recv_action_response(websocket, echo)
+                return await _recv_action_response(websocket, echo), None
     except asyncio.TimeoutError:
-        return StatusResult(False, "timeout", "连接超时（NapCat 可能还在启动中）")
+        return None, StatusResult(False, "timeout", "连接超时（NapCat 可能还在启动中，或会话已卡死）")
     except ConnectionRefusedError:
-        return StatusResult(False, "connection_refused", "连接被拒绝，OneBot 服务还没开始监听（容器启动约需 40 秒）")
+        return None, StatusResult(False, "connection_refused", "连接被拒绝，OneBot 服务还没开始监听（容器启动约需 40 秒）")
     except OSError as e:
-        return StatusResult(False, "connection_refused", f"连接失败: {e}")
+        return None, StatusResult(False, "connection_refused", f"连接失败: {e}")
     except websockets.exceptions.WebSocketException as e:
         if type(e).__name__ == "InvalidStatus":
-            return StatusResult(False, "unauthorized", f"鉴权失败，请检查 access_token: {e}")
-        return StatusResult(False, "connection_closed", f"连接被关闭: {e}")
+            return None, StatusResult(False, "unauthorized", f"鉴权失败，请检查 access_token: {e}")
+        return None, StatusResult(False, "connection_closed", f"连接被关闭: {e}")
     except ValueError as e:
-        return StatusResult(False, "api_error", f"未收到有效的 API 响应: {e}")
+        return None, StatusResult(False, "api_error", f"未收到有效的 API 响应: {e}")
     except Exception as e:
-        return StatusResult(False, "unknown", f"未知错误: {e}")
+        return None, StatusResult(False, "unknown", f"未知错误: {e}")
+
+
+async def check_container_status(container: ContainerConfig, timeout: float = 5.0) -> StatusResult:
+    """
+    通过 OneBot11 的 get_status 检查 Bot 是否在线
+
+    注意：NapCat 的 get_status.online 取自内存里的 selfInfo.online，
+    在"假在线"（连接还在但服务端已不响应）时可能停留在 true，
+    所以还需要 deep_probe_session() 作为第二判据。
+    """
+    result, error = await _ws_action_call(container, "get_status", {}, timeout)
+    if error is not None:
+        return error
 
     if result.get("status") == "ok":
         data = result.get("data") or {}
@@ -179,6 +201,50 @@ async def check_container_status(container: ContainerConfig, timeout: float = 5.
 
     message = result.get("message") or result.get("wording") or "unknown"
     return StatusResult(False, "api_error", f"API 返回错误: {message}")
+
+
+def classify_deep_probe(payload: dict) -> StatusResult:
+    """
+    纯逻辑：判定「深度探测」的结果（便于单测）
+
+    - 正常返回 → 在线
+    - NapCat 不认识该接口（老版本）→ 视为 unsupported，忽略
+    - 其它错误 → 判定为会话卡死（假在线）
+    """
+    if payload.get("status") == "ok":
+        return StatusResult(True, "online", "")
+
+    message = str(payload.get("message") or payload.get("wording") or "")
+    lowered = message.lower()
+    if "不支持" in message or "not support" in lowered or "unknown action" in lowered:
+        return StatusResult(True, "unsupported", "")
+    return StatusResult(False, "session_stuck", f"会话异常（疑似「假在线」，发包无响应）: {message or 'unknown'}")
+
+
+async def deep_probe_session(container: ContainerConfig, timeout: float = 10.0) -> StatusResult:
+    """
+    深度探测：调用一个「需要服务端真实往返」的只读接口，识别假在线
+
+    用 get_cookies 取 QQ 网页 Cookie —— 它必须由服务端签发，会话失效时会超时/报错，
+    而 get_status 只看内存状态，识别不出这种「假在线」。
+
+    注意：首次调用可能是冷启动（较慢），所以超时给到 8 秒，
+    并且调用方要求「连续失败 2 次」才升级为离线判定（见 escalate_deep_failure）。
+    """
+    result, error = await _ws_action_call(container, "get_cookies", {"domain": "qun.qq.com"}, timeout)
+    if error is not None:
+        return error
+    return classify_deep_probe(result)
+
+
+def escalate_deep_failure(state: RestartState, threshold: int = DEEP_FAIL_THRESHOLD) -> bool:
+    """
+    纯逻辑：累计深度探测失败次数，达到阈值才升级为「离线」判定
+
+    目的：单次深度探测失败可能只是冷启动/网络抖动，避免误判导致的误重启。
+    """
+    state.deep_fail_count += 1
+    return state.deep_fail_count >= threshold
 
 
 def _list_container_names(container: ContainerConfig) -> List[str]:
@@ -287,6 +353,101 @@ def restart_container(container: ContainerConfig, name: Optional[str] = None) ->
     if ok:
         return True, f"容器 {target} 重启成功"
     return False, f"容器 {target} 重启失败: {(err or '').strip()}"
+
+
+# 「需要人工介入」的离线信号：这些情况下重启没有意义，只会反复喂风控
+LOGIN_FAIL_SIGNALS = [
+    ("KickedOffLine", "账号被顶下线（在别处登录）"),
+    ("账号状态变更为离线", "账号离线"),
+    ("请扫描下面的二维码", "需要扫码登录"),
+    ("快速登录错误", "快速登录失败"),
+    ("密码回退需要验证码", "密码回退被要求短信验证码"),
+    ("用户身份已失效", "登录态/用户身份已失效"),
+]
+
+
+def match_login_fail_signals(log_text: str) -> List[str]:
+    """纯逻辑：从容器日志里匹配「需要人工介入」的信号（便于单测）"""
+    hits: List[str] = []
+    for marker, desc in LOGIN_FAIL_SIGNALS:
+        if marker in log_text and desc not in hits:
+            hits.append(desc)
+    return hits
+
+
+def collect_login_fail_signals(container: ContainerConfig, window_s: int = 600) -> List[str]:
+    """
+    回溯容器最近 window_s 秒的日志，判断是否属于「重启也解决不了」的故障
+    （被顶下线 / 登录态失效 / 需要扫码 / 需要验证码）
+    """
+    ok, out, _ = _docker_remote(container, f"logs --since {int(window_s)}s {container.name} 2>&1", timeout=30.0)
+    if not ok:
+        return []
+    return match_login_fail_signals(out)
+
+
+def should_notify(state: RestartState, kind: str, min_interval_s: int,
+                  now_monotonic: Optional[float] = None) -> bool:
+    """纯逻辑：同类通知的限流判断（便于单测）"""
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    if state.last_notify_kind != kind or state.last_notify_at is None:
+        return True
+    return (now - state.last_notify_at) >= min_interval_s
+
+
+def notify(config: AppConfig, title: str, message: str) -> bool:
+    """
+    发送通知（可选功能）
+
+    - notify_webhook：POST JSON {"title", "text", "message", "content", "msg"}
+    - notify_telegram_bot_token + notify_telegram_chat_id：Telegram Bot API
+    """
+    sent = False
+
+    if config.notify_webhook:
+        payload = json.dumps({
+            "title": title,
+            "text": message,
+            "message": message,
+            "content": message,
+            "msg": message,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            config.notify_webhook, data=payload, headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                sent = 200 <= response.status < 300
+        except Exception as e:
+            log(f"发送 webhook 通知失败: {e}", "WARN")
+
+    if config.notify_telegram_bot_token and config.notify_telegram_chat_id:
+        url = f"https://api.telegram.org/bot{config.notify_telegram_bot_token}/sendMessage"
+        payload = json.dumps({
+            "chat_id": config.notify_telegram_chat_id,
+            "text": f"{title}\n{message}",
+        }).encode("utf-8")
+        request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                sent = sent or (200 <= response.status < 300)
+        except Exception as e:
+            log(f"发送 Telegram 通知失败: {e}", "WARN")
+
+    return sent
+
+
+def notify_container_event(config: AppConfig, state: RestartState, container: ContainerConfig,
+                           kind: str, title: str, message: str):
+    """带限流的通知封装（未配置通知渠道时静默跳过）"""
+    if not (config.notify_webhook or config.notify_telegram_bot_token):
+        return
+    if not should_notify(state, kind, config.notify_min_interval_s):
+        return
+    if notify(config, f"[{container.name}] {title}", message):
+        state.last_notify_kind = kind
+        state.last_notify_at = time.monotonic()
+        log(f"[{container.name}] 通知已发送: {title}", "INFO")
 
 
 def log(message: str, level: str = "INFO"):

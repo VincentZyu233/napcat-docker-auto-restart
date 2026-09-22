@@ -8,6 +8,14 @@ check_interval_ms: 10000
 # 当有多个容器时，每个容器的检测会错开此间隔，避免同时发送请求
 stagger_interval_ms: 500
 
+# ---- 全局：探测与通知（均可省略，省略时使用默认值）----
+confirm_delay_ms: 3000        # 首次探测失败后的复检等待（毫秒）：过滤瞬时抖动，避免误重启
+offline_log_window_s: 600     # 判定「需要人工介入」时，回溯容器日志的时间窗（秒）
+notify_webhook: ""            # 通知 webhook（POST JSON，含 title/text/message/content 字段），留空则不通知
+notify_telegram_bot_token: "" # Telegram Bot Token（可选，需与 chat_id 同时配置）
+notify_telegram_chat_id: ""   # Telegram Chat ID（可选）
+notify_min_interval_s: 1800   # 同类通知的最小间隔（秒），防止刷屏
+
 # 监控的容器列表
 containers:
   - enabled: true              # Whether this container is enabled for checks
@@ -25,6 +33,7 @@ containers:
     startup_grace_s: 120       # 容器启动后的宽限期（秒）：期间只观察、不重启
     restart_cooldown_s: 300    # 两次自动重启之间的最小间隔（秒）：冷却期内只告警不重启
     max_restart_attempts: 3    # 连续自动重启次数上限：超过后只告警，等人工介入（恢复在线后清零）
+    deep_probe: true           # 深度探测：调用需要服务端往返的接口识别「假在线」（老版本不支持会自动跳过）
 
 # You can add more containers
 # - enabled: true

@@ -21,6 +21,7 @@ class ContainerConfig:
     startup_grace_s: int = 120      # 容器刚启动后的宽限期（秒），期间只观察不重启
     restart_cooldown_s: int = 300   # 两次自动重启之间的最小间隔（秒）
     max_restart_attempts: int = 3   # 连续自动重启次数上限，超过后只告警不再重启
+    deep_probe: bool = True         # 是否用「需要服务端往返」的接口识别假在线
 
 @dataclass
 class AppConfig:
@@ -28,6 +29,12 @@ class AppConfig:
     check_interval_ms: int          # 检测间隔（毫秒）
     stagger_interval_ms: int        # 多容器心跳错开间隔（毫秒）
     containers: List[ContainerConfig]
+    confirm_delay_ms: int = 3000    # 首次探测失败后的复检等待（毫秒），用于过滤瞬时抖动
+    offline_log_window_s: int = 600  # 判定「需要人工介入」时回溯容器日志的时间窗（秒）
+    notify_webhook: str = ""        # 通知 webhook（POST JSON），留空则不发送
+    notify_telegram_bot_token: str = ""   # Telegram Bot Token（可选）
+    notify_telegram_chat_id: str = ""     # Telegram Chat ID（可选）
+    notify_min_interval_s: int = 1800     # 同类通知的最小间隔（秒），防止刷屏
 
 def load_config(config_path: str = None) -> AppConfig:
     """
@@ -74,11 +81,18 @@ def load_config(config_path: str = None) -> AppConfig:
             use_sudo=c.get("use_sudo", False),
             startup_grace_s=c.get("startup_grace_s", 120),
             restart_cooldown_s=c.get("restart_cooldown_s", 300),
-            max_restart_attempts=c.get("max_restart_attempts", 3)
+            max_restart_attempts=c.get("max_restart_attempts", 3),
+            deep_probe=c.get("deep_probe", True)
         ))
     
     return AppConfig(
         check_interval_ms=data.get("check_interval_ms", 10000),
         stagger_interval_ms=data.get("stagger_interval_ms", 500),
-        containers=containers
+        containers=containers,
+        confirm_delay_ms=data.get("confirm_delay_ms", 3000),
+        offline_log_window_s=data.get("offline_log_window_s", 600),
+        notify_webhook=data.get("notify_webhook", ""),
+        notify_telegram_bot_token=data.get("notify_telegram_bot_token", ""),
+        notify_telegram_chat_id=data.get("notify_telegram_chat_id", ""),
+        notify_min_interval_s=data.get("notify_min_interval_s", 1800)
     )

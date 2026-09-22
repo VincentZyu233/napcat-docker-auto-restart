@@ -11,28 +11,52 @@ import time
 
 from config import load_config, AppConfig, ContainerConfig
 from monitor import (
+    DEEP_FAIL_THRESHOLD,
     RestartState,
     check_container_status,
+    collect_login_fail_signals,
+    deep_probe_session,
+    escalate_deep_failure,
     evaluate_restart,
     inspect_container,
+    notify_container_event,
     restart_container,
     log,
 )
 
 
-async def monitor_container(container: ContainerConfig, state: RestartState):
+async def monitor_container(container: ContainerConfig, state: RestartState, config: AppConfig):
     """
     监控单个容器
 
     Args:
         container: 容器配置
         state: 该容器的自动重启节流状态
+        config: 应用配置（用于通知与复检参数）
     """
+    # 1) 基础探测：OneBot get_status
     result = await check_container_status(container)
 
+    # 2) 深度探测：识别「假在线」（get_status 说在线，但服务端已经不响应）
+    if result.online and container.deep_probe:
+        deep = await deep_probe_session(container)
+        if deep.online:
+            state.deep_fail_count = 0
+            if deep.reason == "unsupported":
+                log(f"[{container.name}] 深度探测接口不被当前 NapCat 版本支持，跳过该判据", "INFO")
+        else:
+            # 单次失败不判死（可能是冷启动/瞬时抖动），连续失败才升级为离线
+            escalated = escalate_deep_failure(state)
+            log(f"[{container.name}] 深度探测失败({state.deep_fail_count}/{DEEP_FAIL_THRESHOLD} 次): {deep.message}", "WARN")
+            if escalated:
+                log(f"[{container.name}] 深度探测连续失败 {DEEP_FAIL_THRESHOLD} 次，判定为「假在线」", "ERROR")
+                result = deep
+
     if result.online:
-        if state.attempts > 0:
+        if state.attempts > 0 or state.needs_human:
             log(f"[{container.name}] 已恢复在线 ✓（此前自动重启 {state.attempts} 次）", "SUCCESS")
+            notify_container_event(config, state, container, "recovered", "已恢复在线",
+                                   "Bot 已恢复正常在线状态")
         else:
             log(f"[{container.name}] 在线 ✓", "SUCCESS")
         state.reset()
@@ -40,17 +64,45 @@ async def monitor_container(container: ContainerConfig, state: RestartState):
 
     log(f"[{container.name}] 离线! 原因: {result.message}", "ERROR")
 
-    if not container.auto_restart:
-        return
+    # 3) 复检防抖：过滤瞬时抖动，避免误判导致的误重启
+    if config.confirm_delay_ms > 0:
+        await asyncio.sleep(config.confirm_delay_ms / 1000)
+        confirm = await check_container_status(container)
+        if confirm.online:
+            log(f"[{container.name}] 复检已在线，判定为瞬时抖动，跳过本次处理", "WARN")
+            state.reset()
+            return
+        result = confirm
 
-    # 重启前先看容器本身的状态（是否在运行、启动了多久）
+    # 4) 查看容器本身状态（是否在运行、启动了多久）
     info = await asyncio.to_thread(inspect_container, container)
     if info.message:
         log(f"[{container.name}] {info.message}", "WARN")
 
+    # 5) 识别「重启也解决不了」的故障（被顶下线 / 登录态失效 / 需要扫码 / 需要验证码）
+    signals = await asyncio.to_thread(collect_login_fail_signals, container, config.offline_log_window_s)
+    if signals:
+        log(f"[{container.name}] 检测到需要人工介入的信号: {'、'.join(signals)}", "WARN")
+        log(f"[{container.name}] 这类故障重启无效（只会反复触发风控），已跳过自动重启", "WARN")
+        state.needs_human = True
+        notify_container_event(
+            config, state, container, "needs_human", "需要人工介入",
+            f"信号: {'、'.join(signals)}\n探测原因: {result.message}\n"
+            "建议: 打开 WebUI 扫码或完成短信验证；若为『被顶下线』请检查该 QQ 号是否在别处登录"
+        )
+        return
+
+    if not container.auto_restart:
+        log(f"[{container.name}] 已禁用自动重启，仅记录日志", "INFO")
+        return
+
+    # 6) 按「启动宽限期 → 重启冷却 → 连续重启熔断」决定是否重启
     should_restart, reason = evaluate_restart(container, state, info)
     if not should_restart:
         log(f"[{container.name}] 跳过自动重启: {reason}", "WARN")
+        if "暂停自动重启" in reason:
+            notify_container_event(config, state, container, "breaker", "已触发重启熔断",
+                                   f"{reason}\n探测原因: {result.message}")
         return
 
     log(f"[{container.name}] 正在尝试重启容器 {info.name}（{reason}）...", "WARN")
@@ -72,13 +124,21 @@ async def run_monitor(config: AppConfig):
     """
     log(f"启动监控，检测间隔: {config.check_interval_ms}ms")
     log(f"容器心跳错开间隔: {config.stagger_interval_ms}ms")
+    log(f"离线复检等待: {config.confirm_delay_ms}ms / 人工介入信号回溯: {config.offline_log_window_s}s")
+    notify_channels = []
+    if config.notify_webhook:
+        notify_channels.append("webhook")
+    if config.notify_telegram_bot_token and config.notify_telegram_chat_id:
+        notify_channels.append("telegram")
+    log(f"通知渠道: {'、'.join(notify_channels) if notify_channels else '未配置（仅打印日志）'}")
     log(f"监控容器数量: {len(config.containers)}")
 
     for c in config.containers:
         status_str = "启用" if c.enabled else "禁用"
+        probe_str = "开" if c.deep_probe else "关"
         log(
             f"  - {c.name} ({status_str}) @ {c.ssh_host}:{c.ws_port} "
-            f"[宽限 {c.startup_grace_s}s / 冷却 {c.restart_cooldown_s}s / 最多 {c.max_restart_attempts} 次]"
+            f"[宽限 {c.startup_grace_s}s / 冷却 {c.restart_cooldown_s}s / 最多 {c.max_restart_attempts} 次 / 深度探测 {probe_str}]"
         )
 
     print("-" * 50)
@@ -92,7 +152,7 @@ async def run_monitor(config: AppConfig):
         enabled_containers = [c for c in config.containers if c.enabled]
 
         for i, container in enumerate(enabled_containers):
-            await monitor_container(container, states[container.name])
+            await monitor_container(container, states[container.name], config)
             # 如果不是最后一个容器，等待错开间隔
             if i < len(enabled_containers) - 1:
                 await asyncio.sleep(config.stagger_interval_ms / 1000)
