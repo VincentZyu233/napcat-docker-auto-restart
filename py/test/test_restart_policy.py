@@ -17,6 +17,7 @@ from config import ContainerConfig, load_config  # noqa: E402
 from monitor import (  # noqa: E402
     ContainerInfo,
     RestartState,
+    StatusResult,
     _recv_action_response,
     classify_deep_probe,
     escalate_deep_failure,
@@ -156,6 +157,36 @@ def test_deep_probe_and_signals():
     check("reset 后深度失败计数清零", st.deep_fail_count == 0)
 
 
+def test_deep_probe_retry():
+    print("deep_probe_session 冷缓存重试")
+    import monitor as monitor_module
+
+    container = make_container()
+    original = monitor_module._ws_action_call
+    calls = {"n": 0}
+
+    async def cold_then_ok(container, action, params, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None, StatusResult(False, "timeout", "冷缓存超时")
+        return {"status": "ok", "retcode": 0, "data": {}}, None
+
+    monitor_module._ws_action_call = cold_then_ok
+    try:
+        result = asyncio.run(monitor_module.deep_probe_session(container, attempts=2))
+        check("首次冷缓存失败→重试成功即可判在线", result.online is True, f"实际: {result}")
+        check("确实重试（共 2 次调用）", calls["n"] == 2, f"实际: {calls['n']}")
+
+        async def always_fail(container, action, params, timeout):
+            return None, StatusResult(False, "timeout", "一直超时")
+
+        monitor_module._ws_action_call = always_fail
+        result = asyncio.run(monitor_module.deep_probe_session(container, attempts=2))
+        check("两次都失败→判定异常", (not result.online) and result.reason == "timeout", f"实际: {result}")
+    finally:
+        monitor_module._ws_action_call = original
+
+
 class FakeWebSocket:
     """按顺序吐出预设帧的假 WebSocket，用于测试响应匹配逻辑"""
 
@@ -245,6 +276,7 @@ if __name__ == "__main__":
     test_parse_docker_time()
     test_evaluate_restart()
     test_deep_probe_and_signals()
+    test_deep_probe_retry()
     test_recv_action_response()
     test_config_defaults()
     print("-" * 50)

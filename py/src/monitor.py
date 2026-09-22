@@ -221,20 +221,25 @@ def classify_deep_probe(payload: dict) -> StatusResult:
     return StatusResult(False, "session_stuck", f"会话异常（疑似「假在线」，发包无响应）: {message or 'unknown'}")
 
 
-async def deep_probe_session(container: ContainerConfig, timeout: float = 10.0) -> StatusResult:
+async def deep_probe_session(container: ContainerConfig, timeout: float = 12.0,
+                             attempts: int = 2) -> StatusResult:
     """
     深度探测：调用一个「需要服务端真实往返」的只读接口，识别假在线
 
     用 get_cookies 取 QQ 网页 Cookie —— 它必须由服务端签发，会话失效时会超时/报错，
     而 get_status 只看内存状态，识别不出这种「假在线」。
 
-    注意：首次调用可能是冷启动（较慢），所以超时给到 8 秒，
-    并且调用方要求「连续失败 2 次」才升级为离线判定（见 escalate_deep_failure）。
+    注意（实测）：get_cookies 存在「冷缓存」现象 —— 首次调用可能 12 秒以上，
+    之后缓存生效仅 0.2 秒左右。因此这里同一轮最多重试 attempts 次，
+    **任意一次成功即视为健康**，避免冷启动被误判为「假在线」。
     """
-    result, error = await _ws_action_call(container, "get_cookies", {"domain": "qun.qq.com"}, timeout)
-    if error is not None:
-        return error
-    return classify_deep_probe(result)
+    last = StatusResult(False, "unknown", "深度探测未执行")
+    for _ in range(max(1, attempts)):
+        result, error = await _ws_action_call(container, "get_cookies", {"domain": "qun.qq.com"}, timeout)
+        last = error if error is not None else classify_deep_probe(result)
+        if last.online:
+            return last
+    return last
 
 
 def escalate_deep_failure(state: RestartState, threshold: int = DEEP_FAIL_THRESHOLD) -> bool:
